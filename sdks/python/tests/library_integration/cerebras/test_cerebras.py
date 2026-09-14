@@ -160,3 +160,100 @@ def test_cerebras_chat_completions_create__error__span_and_trace_finished_gracef
     trace_tree = fake_backend.trace_trees[0]
     assert trace_tree.spans[0].error_info is not None
     assert trace_tree.spans[0].provider == "cerebras"
+
+
+def _failing_stream(sync=True):
+    """A cerebras stream that raises partway through iteration."""
+    boom = ValueError("upstream connection reset")
+
+    if sync:
+        stream = cerebras.Stream.__new__(cerebras.Stream)
+
+        def _iter(self):
+            yield _chunk_for_error()
+            raise boom
+
+        cerebras.Stream.__iter__ = _iter
+    else:
+        stream = cerebras.AsyncStream.__new__(cerebras.AsyncStream)
+
+        async def _aiter(self):
+            yield _chunk_for_error()
+            raise boom
+
+        cerebras.AsyncStream.__aiter__ = _aiter
+
+    return stream, boom
+
+
+def _chunk_for_error():
+    return "partial-chunk"
+
+
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+def test_cerebras_stream__mid_stream_failure__debug_record_interpolates(
+    caplog, monkeypatch, sync
+):
+    """The debug line must render, and the original exception must propagate.
+
+    Without the `%s` placeholder, `record.getMessage()` raises TypeError and the
+    logging machinery swallows it, so the only diagnostic for a mid-stream
+    failure is lost.
+    """
+    from opik.integrations.cerebras import stream_patchers
+
+    original_sync = cerebras.Stream.__iter__
+    original_async = cerebras.AsyncStream.__aiter__
+    original_mod_sync = stream_patchers.original_stream_iter_method
+    original_mod_async = stream_patchers.original_async_stream_aiter_method
+
+    finalized = []
+
+    def callback(
+        output,
+        error_info,
+        capture_output,
+        generators_span_to_end,
+        generators_trace_to_end,
+    ):
+        finalized.append(error_info)
+
+    try:
+        stream, boom = _failing_stream(sync=sync)
+        if sync:
+            stream_patchers.original_stream_iter_method = cerebras.Stream.__iter__
+            stream_patchers.patch_sync_stream(stream, "SPAN", None, list, callback)
+        else:
+            stream_patchers.original_async_stream_aiter_method = (
+                cerebras.AsyncStream.__aiter__
+            )
+            stream_patchers.patch_async_stream(stream, "SPAN", None, list, callback)
+
+        caplog.set_level("DEBUG", logger="opik.integrations.cerebras.stream_patchers")
+
+        with pytest.raises(ValueError) as excinfo:
+            if sync:
+                list(stream)
+            else:
+
+                async def _drain():
+                    return [item async for item in stream]
+
+                asyncio.run(_drain())
+
+        # the original exception, not a logging TypeError
+        assert excinfo.value is boom
+
+        records = [r for r in caplog.records if r.levelname == "DEBUG"]
+        assert records, "no debug record was emitted for the mid-stream failure"
+        # getMessage() raises TypeError when the format args don't match
+        rendered = records[-1].getMessage()
+        assert "upstream connection reset" in rendered
+
+        # the span still finalizes, and as an error
+        assert finalized and finalized[-1] is not None
+    finally:
+        cerebras.Stream.__iter__ = original_sync
+        cerebras.AsyncStream.__aiter__ = original_async
+        stream_patchers.original_stream_iter_method = original_mod_sync
+        stream_patchers.original_async_stream_aiter_method = original_mod_async
